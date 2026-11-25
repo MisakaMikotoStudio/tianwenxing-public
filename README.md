@@ -76,6 +76,37 @@ dsh web
 
 想回看某一场，直接说「回看一面」之类的话即可。
 
+## 云端角色卡
+
+角色卡是在[官网](https://tianwenxing.yuban.site)上维护的现成角色：一张卡包含场景（面试 / 商务）、角色姓名职位、完整人设（性格、关注点、雷区、说话风格）和时限。教练可以直接用卡开场，不必每次重新设计角色；你也可以把模拟里的角色上传成卡，沉淀下来复用或分享。
+
+### 1. 在官网准备
+
+1. 注册并登录官网，维护你的角色卡（新建、编辑、公开或私有）。
+2. 在 token 管理里创建一个 API token。
+
+### 2. 配置插件（二选一）
+
+| 方式 | 做法 |
+| --- | --- |
+| DSH 配置 | 在覆盖 `tianwen-coach` 行时设置 `roleCardToken`（见下文[配置](#配置)） |
+| 环境变量 | 启动 DSH 前设置 `TIANWENSTAR_API_TOKEN=<你的 token>` |
+
+其它可选配置：`roleCardApiBase` 覆盖 API 地址（默认 `https://tianwenxing.yuban.site`，环境变量 `TIANWENSTAR_API_BASE` 优先级更低）；`roleCardCacheDir` 或环境变量 `TIANWENSTAR_CACHE_DIR` 改变缓存目录。
+
+### 3. 用法
+
+在对话里直接说：
+
+- 「同步角色卡」：拉取官网的角色卡列表写入本地缓存（含更新时间，供界面显示）。
+- 「列出我的角色卡」：查看本地缓存里已有的卡，不访问网络。
+- 「用角色卡 <卡名> 开始一场」：背景访谈和沟通攻略照常进行，但该场角色直接用卡里的设定，不再由模型生成；场景用卡的场景，时限用卡的时限。适合练习官网针对特定公司、特定岗位准备的角色。
+- 「把这场对方存成角色卡 <名>」或「上传角色卡」：把当前（或指定）一场的角色上传到官网，并在本地缓存里可用；带 `cardId` 参数时更新已有卡。
+
+### 本地缓存与降级
+
+缓存是一个 JSON 文件（`role-cards.json`），默认放在插件安装目录（`dsh plugin add` 克隆或安装本仓库的位置）；用 `roleCardCacheDir` / `TIANWENSTAR_CACHE_DIR` 可以指定其它目录。云端不可达或 token 无效时，本地缓存照常可用，只是无法同步或上传；未配置 token 时，教练会提示你按第 1 步去官网获取。
+
 ## 复盘卡片
 
 在 Web 界面中，一场模拟结束（或回看）的那一轮回答下方会出现「天问星复盘」卡片，包含三个标签页：
@@ -127,6 +158,9 @@ dsh web
 | `maxExchangesPerStage` | 40 | 单场最多对话轮数，达到后结束 |
 | `maxStages` | 6 | 单个模拟最多场数 |
 | `maxStageMinutes` | 120 | 单场时限上限（分钟） |
+| `roleCardApiBase` | `https://tianwenxing.yuban.site` | 角色卡 API 地址；环境变量 `TIANWENSTAR_API_BASE` 优先级更低 |
+| `roleCardToken` | 不设置 | 官网 API token；不设置时读环境变量 `TIANWENSTAR_API_TOKEN` |
+| `roleCardCacheDir` | 插件安装目录 | 本地角色卡缓存目录（`role-cards.json` 所在目录）；环境变量 `TIANWENSTAR_CACHE_DIR` 优先级更低 |
 
 ## 费用与模型
 
@@ -150,7 +184,8 @@ pnpm run build
 
 目录结构：
 
-- `src/coach.ts`：智能体内的教练插件，注册系统提示词段落、`tianwenStar` 会话投影和 6 个工具（`tianwen_create_simulation`、`tianwen_start_stage`、`tianwen_reply`、`tianwen_end_stage`、`tianwen_review`、`tianwen_status`）。
+- `src/coach.ts`：智能体内的教练插件，注册系统提示词段落、`tianwenStar` 会话投影和 9 个工具（`tianwen_create_simulation`、`tianwen_start_stage`、`tianwen_reply`、`tianwen_end_stage`、`tianwen_review`、`tianwen_status`、`tianwen_sync_role_cards`、`tianwen_list_role_cards`、`tianwen_save_role_card`）。
+- `src/cards.ts`：云端角色卡：官网 API 客户端、本地缓存（`role-cards.json`）和卡到模拟阶段的映射。
 - `src/prompts.ts`：教练、角色和评估者的提示词。
 - `src/rubric.ts`：默认评估维度、结论等级、加权计分和客观指标。
 - `src/projection.ts`：从会话日志折叠出模拟状态，并在一场结束前对浏览器隐藏对话和内心想法。

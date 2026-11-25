@@ -20,6 +20,19 @@ import { defineTool, ToolArgsError, ToolContextUnavailableError } from '@deepsee
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { acceptPersona, evaluationAcceptor } from './answers.js'
 import type { PersonaAnswer } from './answers.js'
+import {
+  cardSummary,
+  findCardByName,
+  pushRemoteCard,
+  readCardCache,
+  resolveApiBase,
+  resolveCachePath,
+  resolveToken,
+  syncRoleCards,
+  upsertCard,
+  writeCardCache,
+} from './cards.js'
+import type { RoleCard, RoleCardEndpoint, RoleCardUpload } from './cards.js'
 import { callStructured, resolveRoute, TianwenError } from './llm.js'
 import type { CallControls, ReasoningChoice, RouteOverride } from './llm.js'
 import {
@@ -93,6 +106,12 @@ export interface Config {
   maxStages: number
   /** Longest planned stage duration in minutes. */
   maxStageMinutes: number
+  /** Base URL of the 天问星 role-card API. */
+  roleCardApiBase: string
+  /** API token created on the 天问星 website; omit to read TIANWENSTAR_API_TOKEN. */
+  roleCardToken?: string
+  /** Directory of the local role-card cache; omit to store role-cards.json in the package directory. */
+  roleCardCacheDir?: string
 }
 
 const reasoning = Schema.union(['lowest', 'default', 'highest'] as const)
@@ -114,6 +133,10 @@ export const Config: Schema<Config> = Schema.object({
   maxExchangesPerStage: Schema.natural().min(2).default(40),
   maxStages: Schema.natural().min(1).default(6),
   maxStageMinutes: Schema.natural().min(5).default(120),
+  roleCardApiBase: Schema.string().default('https://tianwenxing.yuban.site')
+    .description('Base URL of the 天问星 role-card API; the TIANWENSTAR_API_BASE environment variable applies only when this is empty.'),
+  roleCardToken: Schema.string().description('API token created on the 天问星 website; omit to read the TIANWENSTAR_API_TOKEN environment variable.'),
+  roleCardCacheDir: Schema.string().description('Directory of the local role-card cache; omit to store role-cards.json in the installed package directory.'),
 })
 
 const textOutput = {
@@ -169,8 +192,9 @@ function nonEmpty(value: string, path: string, violations: string[]): string {
 interface StageInput {
   name: string
   objective: string
-  timeLimitMinutes: number
-  counterpart: {
+  timeLimitMinutes?: number
+  roleCardId?: string
+  counterpart?: {
     name: string
     title: string
     organization: string
@@ -182,15 +206,46 @@ interface StageInput {
   rubric?: { name: string; weight: number; description: string; low: string; mid: string; high: string }[]
 }
 
-function buildStages(scenario: Scenario, inputs: readonly StageInput[], config: Config): StageSpec[] {
+/** The stage a card determines; aligned with `inputs` by index. */
+type CardOfStage = readonly (RoleCard | undefined)[]
+
+function buildStages(scenario: Scenario, inputs: readonly StageInput[], config: Config, cards: CardOfStage): StageSpec[] {
   const violations: string[] = []
   if (inputs.length === 0 || inputs.length > config.maxStages) {
     violations.push(`stages must contain 1 to ${config.maxStages} stages (got ${inputs.length})`)
   }
   const stages = inputs.map((input, index): StageSpec => {
     const path = `stages[${index}]`
-    if (!(input.timeLimitMinutes >= 1 && input.timeLimitMinutes <= config.maxStageMinutes)) {
-      violations.push(`${path}.timeLimitMinutes must be between 1 and ${config.maxStageMinutes}`)
+    const card = cards[index]
+    let timeLimitMinutes: number
+    let counterpart: StageInput['counterpart']
+    if (input.roleCardId !== undefined && card === undefined) {
+      violations.push(`${path}.roleCardId "${input.roleCardId}" is not in the local role-card cache; call tianwen_list_role_cards for available cards`)
+    }
+    if (card !== undefined) {
+      if (card.scenario !== scenario) {
+        violations.push(`${path}.roleCardId: card ${card.name} is a ${card.scenario} card, but the simulation scenario is ${scenario}`)
+      }
+      const requested = input.timeLimitMinutes ?? card.timeLimitMinutes
+      timeLimitMinutes = requested === undefined || requested === null
+        ? Number.NaN
+        : Math.min(requested, config.maxStageMinutes)
+      if (!(timeLimitMinutes >= 1)) violations.push(`${path}.timeLimitMinutes is required: card ${card.name} has no time limit`)
+      counterpart = card.counterpart
+    } else {
+      if (input.timeLimitMinutes === undefined) {
+        violations.push(`${path}.timeLimitMinutes is required when roleCardId is omitted`)
+        timeLimitMinutes = Number.NaN
+      } else {
+        timeLimitMinutes = input.timeLimitMinutes
+        if (!(timeLimitMinutes >= 1 && timeLimitMinutes <= config.maxStageMinutes)) {
+          violations.push(`${path}.timeLimitMinutes must be between 1 and ${config.maxStageMinutes}`)
+        }
+      }
+      if (input.counterpart === undefined) {
+        violations.push(`${path}.counterpart is required when roleCardId is omitted`)
+        counterpart = undefined
+      }
     }
     const rubric: RubricDimension[] = input.rubric === undefined || input.rubric.length === 0
       ? defaultRubric(scenario)
@@ -204,20 +259,22 @@ function buildStages(scenario: Scenario, inputs: readonly StageInput[], config: 
           anchors: { low: dimension.low.trim(), mid: dimension.mid.trim(), high: dimension.high.trim() },
         }
       })
-    const { counterpart } = input
+    const designed = counterpart ?? {
+      name: '', title: '', organization: '', personality: '', priorities: '', hiddenConcerns: '', speakingStyle: '',
+    }
     return {
       id: `s${index + 1}`,
       name: nonEmpty(input.name, `${path}.name`, violations),
       objective: input.objective.trim(),
-      timeLimitMinutes: input.timeLimitMinutes,
+      timeLimitMinutes,
       counterpart: {
-        name: nonEmpty(counterpart.name, `${path}.counterpart.name`, violations),
-        title: nonEmpty(counterpart.title, `${path}.counterpart.title`, violations),
-        organization: counterpart.organization.trim(),
-        personality: counterpart.personality.trim(),
-        priorities: counterpart.priorities.trim(),
-        hiddenConcerns: counterpart.hiddenConcerns.trim(),
-        speakingStyle: counterpart.speakingStyle.trim(),
+        name: nonEmpty(designed.name, `${path}.counterpart.name`, violations),
+        title: nonEmpty(designed.title, `${path}.counterpart.title`, violations),
+        organization: designed.organization.trim(),
+        personality: designed.personality.trim(),
+        priorities: designed.priorities.trim(),
+        hiddenConcerns: designed.hiddenConcerns.trim(),
+        speakingStyle: designed.speakingStyle.trim(),
       },
       rubric,
     }
@@ -299,6 +356,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     timeoutMs: config.evaluationTimeoutMs,
     reasoning: config.evaluationReasoning,
   }
+  const cardEndpoint: RoleCardEndpoint = {
+    base: resolveApiBase(config.roleCardApiBase),
+    token: resolveToken(config.roleCardToken),
+  }
+  const cardCacheFile = resolveCachePath(config.roleCardCacheDir)
 
   const projectionReady = ctx.sessionProjections.register<typeof PROJECTION_KEY, ProjectionState>({
     key: PROJECTION_KEY,
@@ -360,11 +422,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
           properties: {
             name: { type: 'string', required: true, description: 'Stage name, such as 一面（技术面）.' },
             objective: { type: 'string', required: true, description: 'What the counterpart wants to learn or decide in this stage.' },
-            timeLimitMinutes: { type: 'number', required: true, description: 'Realistic planned duration in minutes.' },
+            roleCardId: { type: 'string', description: 'Id or name of a local role card (see tianwen_list_role_cards) to use as this stage\'s counterpart. '
+              + 'The card provides the persona and, unless the card carries none, the time limit; do not invent counterpart fields for that stage.' },
+            timeLimitMinutes: { type: 'number', description: 'Realistic planned duration in minutes; required unless a roleCardId provides one.' },
             counterpart: {
               type: 'object',
-              required: true,
               additionalProperties: false,
+              description: 'Required unless roleCardId is set.',
               properties: {
                 name: { type: 'string', required: true, description: 'Name, such as 王磊 or 李总.' },
                 title: { type: 'string', required: true, description: 'Job title.' },
@@ -397,11 +461,17 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     },
     output: textOutput,
     isConcurrencySafe: () => false,
-    execute(args, exec) {
+    async execute(args, exec) {
       const session = sessionOf(exec)
       const state = stateOf(session)
       const scenario: Scenario = args.scenario
-      const stages = buildStages(scenario, args.stages, config)
+      const cachedCards = args.stages.some(stage => stage.roleCardId !== undefined)
+        ? await readCardCache(cardCacheFile)
+        : []
+      const cards: CardOfStage = args.stages.map(stage => stage.roleCardId === undefined
+        ? undefined
+        : findCardByName(cachedCards, stage.roleCardId))
+      const stages = buildStages(scenario, args.stages, config, cards)
       const simulation: SimulationSpec = {
         id: nextSimulationId(state),
         scenario,
@@ -597,6 +667,97 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       return Promise.resolve({ text: statusReport(stateOf(sessionOf(exec)), Date.now()) })
     },
     presentCall: () => ({ card: 'generic', title: 'Simulation status', kind: 'read' }),
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'tianwen_sync_role_cards',
+    description: 'Sync role cards from the 天问星 website into the local cache. '
+      + 'Requires a website token (roleCardToken config or the TIANWENSTAR_API_TOKEN environment variable); '
+      + 'the tool error explains how to get one when it is missing.',
+    parameters: {},
+    output: textOutput,
+    isConcurrencySafe: () => false,
+    async execute(_args, _exec) {
+      const { cards, invalid } = await syncRoleCards(cardEndpoint, cardCacheFile)
+      const skipped = invalid > 0 ? ` ${invalid} 张因格式无效被跳过。` : ''
+      if (cards.length === 0) {
+        return { text: `同步完成，但云端没有任何可用角色卡。${skipped}可以在天问星官网维护角色卡后重新同步。` }
+      }
+      return {
+        text: `已同步 ${cards.length} 张角色卡到本地缓存（云端不可用时仍可用）。${skipped}\n`
+          + `${cards.map(cardSummary).join('\n')}\n`
+          + '用户说「用角色卡 <名称> 开始一场」时，在 tianwen_create_simulation 的对应 stage 传 roleCardId。',
+      }
+    },
+    presentCall: () => ({ card: 'generic', title: 'Sync role cards', kind: 'other' }),
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'tianwen_list_role_cards',
+    description: 'List the role cards currently in the local cache, without contacting the cloud.',
+    parameters: {},
+    output: textOutput,
+    isConcurrencySafe: () => true,
+    async execute(_args, _exec) {
+      const cards = await readCardCache(cardCacheFile)
+      if (cards.length === 0) {
+        return {
+          text: '本地还没有角色卡。同步需要天问星官网 token：在官网 https://tianwenxing.yuban.site 创建 token，'
+            + '配置到 tianwen-coach 的 roleCardToken 或环境变量 TIANWENSTAR_API_TOKEN，然后调用 tianwen_sync_role_cards。'
+            + '也可以不等角色卡，按背景访谈的信息直接设计角色。',
+        }
+      }
+      return {
+        text: `本地缓存里有 ${cards.length} 张角色卡：\n${cards.map(cardSummary).join('\n')}\n`
+          + '用户说「用角色卡 <名称> 开始一场」时，在 tianwen_create_simulation 的对应 stage 传 roleCardId；'
+          + '要拉取官网最新内容时调用 tianwen_sync_role_cards。',
+      }
+    },
+    presentCall: () => ({ card: 'generic', title: 'List role cards', kind: 'read' }),
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'tianwen_save_role_card',
+    description: 'Upload the counterpart of one 天问星 stage as a role card to the 天问星 website and cache it locally. '
+      + 'Requires a website token (roleCardToken config or the TIANWENSTAR_API_TOKEN environment variable).',
+    parameters: {
+      name: { type: 'string', required: true, description: 'Role-card name, such as 李总（采购总监）.' },
+      simulationId: { type: 'string', required: true },
+      stageId: { type: 'string', description: 'Stage whose counterpart becomes the card; omit for the running stage, else the latest ended stage.' },
+      cardId: { type: 'string', description: 'Id of an existing card of the token holder to update; omit to create a new card.' },
+      public: { type: 'boolean', description: 'Whether the card is publicly listed on the website; omit to keep the server default.' },
+    },
+    output: textOutput,
+    isConcurrencySafe: () => false,
+    async execute(args, exec) {
+      const session = sessionOf(exec)
+      const state = stateOf(session)
+      const simulation = requireSimulation(state, args.simulationId)
+      const running = activeStage(state)
+      const stageId = args.stageId
+        ?? (running !== undefined && running.simulation.spec.id === simulation.spec.id ? running.stage.id : undefined)
+        ?? simulation.stages.findLast(stage => stage.status === 'ended')?.id
+      if (stageId === undefined) {
+        throw stateError(`No stage of ${simulation.spec.id} can be saved yet: run a stage first, or pass the stageId of an ended stage.`)
+      }
+      const spec = stageSpecOf(simulation, stageId)
+      const upload: RoleCardUpload = {
+        id: args.cardId,
+        name: args.name.trim(),
+        scenario: simulation.spec.scenario,
+        counterpart: spec.counterpart,
+        timeLimitMinutes: spec.timeLimitMinutes,
+        public: args.public,
+      }
+      const card = await pushRemoteCard(cardEndpoint, upload)
+      const cached = await readCardCache(cardCacheFile)
+      await writeCardCache(upsertCard(cached, card), cardCacheFile)
+      return {
+        text: `已把 ${stageId} 的角色（${spec.counterpart.name}，${spec.counterpart.title}）存为角色卡「${card.name}」（id ${card.id}，${card.public ? '公开' : '私有'}）。`
+          + '该卡已写入本地缓存，可在天问星官网查看和管理；用户之后可以直接「用角色卡」开始一场。',
+      }
+    },
+    presentCall: () => ({ card: 'generic', title: 'Save role card', kind: 'other' }),
   }))
 
   const handle = await projectionReady

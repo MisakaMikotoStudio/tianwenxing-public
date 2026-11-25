@@ -29,6 +29,8 @@ export type TianwenErrorCode =
   | 'TIANWEN_MODEL_FAILED'
   | 'TIANWEN_MODEL_OUTPUT_INVALID'
   | 'TIANWEN_STATE'
+  | 'TIANWEN_CLOUD_AUTH'
+  | 'TIANWEN_CLOUD_UNAVAILABLE'
 
 /** Expected 天问星 tool failure with a stable code. */
 export class TianwenError extends HarnessError {
